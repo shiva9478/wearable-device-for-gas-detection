@@ -1,254 +1,318 @@
-/*
- * ESP32 SERVER - DEBUGGED VERSION
- * Key fixes applied
- */
-
-#include <WiFi.h>
-#include <HTTPClient.h>
 #include <esp_now.h>
-#include <WebServer.h>
-#include <SPIFFS.h>
-#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <FirebaseESP32.h>
+#include <esp_task_wdt.h>
 
-// Configuration
+// ==================== FIREBASE CREDENTIALS ====================
+#define FIREBASE_HOST "elites1-a4e94-default-rtdb.firebaseio.com"
+#define FIREBASE_AUTH "AIzaSyBAV_aiAL2txd2jQ1zIBVVXwg0DwSEvCfo"
+
+// ==================== WIFI CREDENTIALS ====================
 #define WIFI_SSID "Andromeda"
 #define WIFI_PASSWORD "09876543"
-#define FIREBASE_HOST "https://elites1-a4e94-default-rtdb.firebaseio.com"
-#define FIREBASE_AUTH "AIzaSyBAV_aiAL2txd2jQ1zIBVVXwg0DwSEvCfo"
-#define WEB_SERVER_PORT 80
 
-// MAC Whitelist
-uint8_t allowedMACs[][6] = {
-  {0x10, 0x06, 0x1C, 0x68, 0x85, 0x14}
-};
-int numAllowedMACs = 1;
+// ==================== WATCHDOG TIMEOUT ====================
+#define WDT_TIMEOUT 30
 
-// Data Structure
-typedef struct sensor_data {
+// ==================== GLOBAL VARIABLES ====================
+FirebaseData firebaseData;
+FirebaseConfig firebaseConfig;
+FirebaseAuth firebaseAuth;
+
+uint32_t messageCount = 0;
+uint32_t uploadCount = 0;
+uint32_t uploadFailed = 0;
+bool senderConnected = false;
+unsigned long lastStatusUpdate = 0;
+
+// ==================== SENSOR DATA STRUCTURE ====================
+typedef struct {
   float temperature;
   float humidity;
-  int mq_value;
-  float heartRate;
-  float spo2;
-  char mac[18];
+  int mqValue;
+  int messageNumber;
   unsigned long timestamp;
-} sensor_data;
+} SensorData;
 
-// Global Variables
-WebServer server(WEB_SERVER_PORT);
-HTTPClient http;
-sensor_data receivedData;
-bool newDataAvailable = false;
-bool wifiConnected = false;
-bool dataStoredInSPIFFS = false;
-unsigned long lastDataReceived = 0;
+SensorData latestData;
+bool hasNewData = false;
 
-// ESP-NOW Callback - FIX: Added compatibility wrapper
-void OnDataRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
-  char macStr[18];
-  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-           mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+// ==================== FUNCTION DECLARATIONS ====================
+void printStartupBanner();
+void initWiFi();
+void initESPNOW();
+void initFirebase();
+void onDataReceived(const uint8_t *mac, const uint8_t *data, int len);
+void uploadLatestData();
+void updateRealtimeData();
+void printStatus();
+bool parseTextData(const char* text, SensorData &data);
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
   
-  Serial.printf("📡 Data from: %s\n", macStr);
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL);
   
-  bool isAllowed = false;
-  for(int i = 0; i < numAllowedMACs; i++) {
-    if(memcmp(mac_addr, allowedMACs[i], 6) == 0) {
-      isAllowed = true;
+  printStartupBanner();
+  
+  initWiFi();
+  initESPNOW();
+  initFirebase();
+  
+  Serial.println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.println("🚀 Setup complete! System ready.");
+  Serial.printf("📡 ESP-NOW listening on channel %d\n", WiFi.channel());
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+}
+
+// ==================== LOOP ====================
+void loop() {
+  esp_task_wdt_reset();
+  
+  // Upload new data immediately (non-blocking)
+  if (hasNewData) {
+    hasNewData = false;
+    updateRealtimeData();  // Update current readings
+    // Skip historical data upload to reduce load
+  }
+  
+  if (millis() - lastStatusUpdate > 10000) {
+    printStatus();
+    lastStatusUpdate = millis();
+  }
+  
+  delay(50);
+}
+
+// ==================== STARTUP BANNER ====================
+void printStartupBanner() {
+  Serial.println("\n\n");
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  Serial.println("   🏥 ESP32 HEALTH MONITOR - RECEIVER   ");
+  Serial.println("   📊 Real-time Mode - Optimized        ");
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+}
+
+// ==================== WIFI INITIALIZATION ====================
+void initWiFi() {
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.disconnect();
+  delay(100);
+  
+  Serial.println("🔍 Scanning for network...");
+  int n = WiFi.scanNetworks();
+  int targetChannel = 1;
+  bool found = false;
+  
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == WIFI_SSID) {
+      targetChannel = WiFi.channel(i);
+      found = true;
+      Serial.printf("✅ Found network on channel: %d\n", targetChannel);
       break;
     }
   }
   
-  if(!isAllowed) {
-    Serial.println("⚠️ UNAUTHORIZED MAC");
-    return;
+  if (!found) {
+    Serial.println("⚠️ Network not found, using default channel 1");
   }
   
-  memcpy(&receivedData, data, sizeof(receivedData));
-  strcpy(receivedData.mac, macStr);
-  receivedData.timestamp = millis();
-  newDataAvailable = true;
-  lastDataReceived = millis();
-  
-  Serial.printf("✅ Temp:%.1f Hum:%.1f MQ:%d HR:%.0f SpO2:%.1f\n", 
-                receivedData.temperature, receivedData.humidity, 
-                receivedData.mq_value, receivedData.heartRate, receivedData.spo2);
-}
-
-// SPIFFS Functions
-void initSPIFFS() {
-  if(!SPIFFS.begin(true)) {
-    Serial.println("❌ SPIFFS Failed");
-    return;
-  }
-  Serial.println("✅ SPIFFS OK");
-}
-
-void saveToSPIFFS(sensor_data data) {
-  File file = SPIFFS.open("/sensor_log.txt", FILE_APPEND);
-  if(!file) return;
-  
-  char buffer[250];
-  snprintf(buffer, sizeof(buffer), "%lu|%s|%.2f|%.2f|%d|%.2f|%.2f\n",
-           data.timestamp, data.mac, data.temperature, data.humidity, 
-           data.mq_value, data.heartRate, data.spo2);
-  
-  file.print(buffer);
-  file.close();
-  dataStoredInSPIFFS = true;
-  Serial.println("💾 Saved to SPIFFS");
-}
-
-void cleanSPIFFS() {
-  if(!dataStoredInSPIFFS) return;
-  if(SPIFFS.remove("/sensor_log.txt")) {
-    dataStoredInSPIFFS = false;
-    Serial.println("🧹 SPIFFS Cleaned");
-  }
-}
-
-// FIX: Simplified Firebase function with better error handling
-bool sendToFirebase(sensor_data data) {
-  if(!wifiConnected) {
-    saveToSPIFFS(data);
-    return false;
-  }
-  
-  String path = "/sensor_readings/" + String(data.mac);
-  path.replace(":", "_");
-  path += "/current";
-  
-  DynamicJsonDocument doc(512);
-  doc["temperature"] = data.temperature;
-  doc["humidity"] = data.humidity;
-  doc["mq_value"] = data.mq_value;
-  doc["heartRate"] = data.heartRate;
-  doc["spo2"] = data.spo2;
-  doc["timestamp"] = data.timestamp;
-  doc["lastUpdate"] = millis();
-  
-  String jsonStr;
-  serializeJson(doc, jsonStr);
-  
-  // FIX: Try without auth first
-  String url = String(FIREBASE_HOST) + path + ".json";
-  
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(5000);
-  int httpCode = http.PUT(jsonStr);
-  
-  Serial.printf("Firebase: %d - %s\n", httpCode, httpCode == 200 ? "OK" : http.getString().c_str());
-  
-  http.end();
-  
-  if(httpCode == 200 || httpCode == 201) {
-    Serial.println("✅ Firebase OK");
-    if(dataStoredInSPIFFS) cleanSPIFFS();
-    return true;
-  } else {
-    Serial.printf("❌ Firebase Error: %d\n", httpCode);
-    saveToSPIFFS(data);
-    return false;
-  }
-}
-
-// Web Server Handlers
-void handleRoot() {
-  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>ESP32 Monitor</title><style>";
-  html += "body{font-family:Arial;background:#1a1a2e;color:#fff;margin:0;padding:20px}";
-  html += ".card{background:#16213e;padding:20px;border-radius:10px;margin:10px 0}";
-  html += ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px}";
-  html += ".box{background:#0f3460;padding:20px;border-radius:8px;text-align:center}";
-  html += ".val{font-size:2em;font-weight:bold;margin:10px 0}";
-  html += ".label{opacity:0.8;font-size:0.9em}</style></head><body>";
-  html += "<h1>ESP32 Sensor Monitor</h1>";
-  html += "<div class='card'><h2>Sensor Data</h2><div class='grid'>";
-  html += "<div class='box'><div class='label'>Temperature</div><div class='val' id='t'>--</div><div>°C</div></div>";
-  html += "<div class='box'><div class='label'>Humidity</div><div class='val' id='h'>--</div><div>%</div></div>";
-  html += "<div class='box'><div class='label'>MQ Sensor</div><div class='val' id='m'>--</div><div>PPM</div></div>";
-  html += "<div class='box'><div class='label'>Heart Rate</div><div class='val' id='hr'>--</div><div>bpm</div></div>";
-  html += "<div class='box'><div class='label'>SpO2</div><div class='val' id='sp'>--</div><div>%</div></div>";
-  html += "</div></div>";
-  html += "<script>setInterval(()=>{fetch('/data').then(r=>r.json()).then(d=>{";
-  html += "document.getElementById('t').textContent=d.temp.toFixed(1);";
-  html += "document.getElementById('h').textContent=d.humidity.toFixed(1);";
-  html += "document.getElementById('m').textContent=d.mq;";
-  html += "document.getElementById('hr').textContent=d.hr.toFixed(0);";
-  html += "document.getElementById('sp').textContent=d.spo2.toFixed(1);";
-  html += "})},2000);</script></body></html>";
-  server.send(200, "text/html", html);
-}
-
-void handleData() {
-  DynamicJsonDocument doc(256);
-  doc["temp"] = receivedData.temperature;
-  doc["humidity"] = receivedData.humidity;
-  doc["mq"] = receivedData.mq_value;
-  doc["hr"] = receivedData.heartRate;
-  doc["spo2"] = receivedData.spo2;
-  doc["mac"] = receivedData.mac;
-  
-  String output;
-  serializeJson(doc, output);
-  server.send(200, "application/json", output);
-}
-
-void setup() {
-  Serial.begin(9600);  // FIX: Changed from 115200
-  delay(2000);
-  Serial.println("\n=== ESP32 SERVER ===\n");
-  
-  initSPIFFS();
-  
-  // WiFi
-  WiFi.mode(WIFI_STA);
+  Serial.println("📶 Connecting...");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("WiFi connecting");
   
-  int timeout = 20;
-  while(WiFi.status() != WL_CONNECTED && timeout > 0) {
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
     delay(500);
     Serial.print(".");
-    timeout--;
+    attempts++;
+    esp_task_wdt_reset();
   }
   
-  Serial.println();
-  if(WiFi.status() == WL_CONNECTED) {
-    wifiConnected = true;
-    Serial.println("✅ WiFi OK");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi connected!");
+    Serial.printf("   IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("   Channel: %d\n", WiFi.channel());
+    
+    esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE);
+    
+    IPAddress dns1(8, 8, 8, 8);
+    IPAddress dns2(8, 8, 4, 4);
+    WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), dns1, dns2);
+    Serial.println("✅ DNS configured");
+    
+    delay(1000);
   } else {
-    Serial.println("⚠️ WiFi Failed - Offline Mode");
-  }
-  
-  // ESP-NOW
-  if(esp_now_init() != ESP_OK) {
-    Serial.println("❌ ESP-NOW Failed");
+    Serial.println("\n❌ WiFi connection failed!");
     ESP.restart();
   }
-  
-  esp_now_register_recv_cb(OnDataRecv);
-  Serial.printf("✅ ESP-NOW OK - %d clients registered\n", numAllowedMACs);
-  
-  // Web Server
-  server.on("/", handleRoot);
-  server.on("/data", handleData);
-  server.begin();
-  
-  Serial.println("✅ Server Ready\n");
 }
 
-void loop() {
-  server.handleClient();
+// ==================== ESP-NOW INITIALIZATION ====================
+void initESPNOW() {
+  int channel = WiFi.channel();
+  Serial.printf("Configuring ESP-NOW on channel %d\n", channel);
   
-  if(newDataAvailable) {
-    sendToFirebase(receivedData);
-    newDataAvailable = false;
+  esp_now_deinit();
+  delay(100);
+  
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("❌ ESP-NOW init failed!");
+    ESP.restart();
+    return;
   }
   
-  delay(10);
+  Serial.println("✅ ESP-NOW initialized");
+  
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  Serial.printf("📟 Receiver MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  
+  esp_now_register_recv_cb(onDataReceived);
+  Serial.println("✅ ESP-NOW callback registered");
+}
+
+// ==================== FIREBASE INITIALIZATION ====================
+void initFirebase() {
+  firebaseConfig.host = FIREBASE_HOST;
+  firebaseConfig.signer.tokens.legacy_token = FIREBASE_AUTH;
+  
+  // Very short timeout for real-time updates
+  firebaseConfig.timeout.serverResponse = 3 * 1000;
+  firebaseConfig.timeout.socketConnection = 3 * 1000;
+  
+  Firebase.begin(&firebaseConfig, &firebaseAuth);
+  Firebase.reconnectWiFi(true);
+  
+  firebaseData.setBSSLBufferSize(512, 512);
+  
+  Serial.println("✅ Firebase initialized");
+  
+  // Initialize database structure
+  esp_task_wdt_reset();
+  Firebase.setString(firebaseData, "/current/status", "online");
+  Firebase.setFloat(firebaseData, "/current/temperature", 0.0);
+  Firebase.setFloat(firebaseData, "/current/humidity", 0.0);
+  Firebase.setInt(firebaseData, "/current/mqValue", 0);
+  Serial.println("✅ Database structure initialized");
+}
+
+// ==================== ESP-NOW DATA RECEIVED CALLBACK ====================
+void onDataReceived(const uint8_t *mac, const uint8_t *data, int len) {
+  messageCount++;
+  senderConnected = true;
+  
+  char receivedText[256];
+  memcpy(receivedText, data, len);
+  receivedText[len] = '\0';
+  
+  SensorData tempData;
+  if (parseTextData(receivedText, tempData)) {
+    latestData = tempData;
+    latestData.timestamp = millis();
+    hasNewData = true;
+    
+    Serial.printf("\r📡 Msg#%d | 🌡️%.1f°C | 💧%.1f%% | 🔬%d        ", 
+                  messageCount, latestData.temperature, 
+                  latestData.humidity, latestData.mqValue);
+  }
+}
+
+// ==================== PARSE TEXT DATA ====================
+bool parseTextData(const char* text, SensorData &data) {
+  data.temperature = 0;
+  data.humidity = 0;
+  data.mqValue = 0;
+  data.messageNumber = 0;
+  
+  String dataStr = String(text);
+  bool isStoredMessage = dataStr.startsWith("STORED|");
+  
+  if (isStoredMessage) {
+    dataStr = dataStr.substring(7);
+  }
+  
+  int tIndex = dataStr.indexOf("T:");
+  int hIndex = dataStr.indexOf("H:");
+  int mqIndex = dataStr.indexOf("MQ:");
+  
+  if (tIndex != -1 && hIndex != -1 && mqIndex != -1) {
+    int tEnd = dataStr.indexOf("|", tIndex);
+    if (tEnd != -1) {
+      data.temperature = dataStr.substring(tIndex + 2, tEnd).toFloat();
+    }
+    
+    int hEnd = dataStr.indexOf("|", hIndex);
+    if (hEnd != -1) {
+      data.humidity = dataStr.substring(hIndex + 2, hEnd).toFloat();
+    }
+    
+    int mqEnd = dataStr.indexOf("|", mqIndex);
+    if (mqEnd == -1) mqEnd = dataStr.length();
+    data.mqValue = dataStr.substring(mqIndex + 3, mqEnd).toInt();
+    
+    if (isStoredMessage) {
+      int timeIndex = dataStr.indexOf("Time:");
+      if (timeIndex != -1) {
+        data.messageNumber = dataStr.substring(timeIndex + 5).toInt();
+      }
+    } else {
+      int msgIndex = dataStr.indexOf("|#");
+      if (msgIndex != -1) {
+        data.messageNumber = dataStr.substring(msgIndex + 2).toInt();
+      }
+    }
+    
+    return true;
+  }
+  
+  return false;
+}
+
+// ==================== UPDATE REALTIME DATA ====================
+void updateRealtimeData() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  esp_task_wdt_reset();
+  
+  // Use Firebase stream for real-time updates (faster than setJSON)
+  static unsigned long lastUpdate = 0;
+  if (millis() - lastUpdate < 200) return;  // Max 5 updates/sec
+  
+  lastUpdate = millis();
+  
+  // Update current values only (much faster than full JSON)
+  bool success = true;
+  success &= Firebase.setFloat(firebaseData, "/current/temperature", latestData.temperature);
+  success &= Firebase.setFloat(firebaseData, "/current/humidity", latestData.humidity);
+  success &= Firebase.setInt(firebaseData, "/current/mqValue", latestData.mqValue);
+  success &= Firebase.setInt(firebaseData, "/current/messageNumber", latestData.messageNumber);
+  success &= Firebase.setInt(firebaseData, "/current/timestamp", latestData.timestamp);
+  
+  if (success) {
+    uploadCount++;
+  } else {
+    uploadFailed++;
+  }
+  
+  esp_task_wdt_reset();
+}
+
+// ==================== PRINT STATUS ====================
+void printStatus() {
+  Serial.println("\n\n━━━━━━━━━━━━━━ STATUS ━━━━━━━━━━━━━");
+  Serial.printf("📊 Received: %d | Uploaded: %d | Failed: %d\n", 
+                messageCount, uploadCount, uploadFailed);
+  Serial.printf("📶 WiFi: %s (Ch %d)\n", 
+                WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected",
+                WiFi.channel());
+  Serial.printf("🔗 Sender: %s\n", senderConnected ? "Active" : "Waiting");
+  Serial.printf("🔥 Firebase: %s\n", Firebase.ready() ? "Ready" : "Not Ready");
+  Serial.printf("📈 Success Rate: %.1f%%\n", 
+                messageCount > 0 ? (float)uploadCount/messageCount*100 : 0);
+  Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 }
