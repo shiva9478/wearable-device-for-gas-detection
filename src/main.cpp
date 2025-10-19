@@ -5,8 +5,8 @@
 #include <esp_task_wdt.h>
 
 // ==================== FIREBASE CREDENTIALS ====================
-#define FIREBASE_HOST "elites1-a4e94-default-rtdb.firebaseio.com"
-#define FIREBASE_AUTH "AIzaSyBAV_aiAL2txd2jQ1zIBVVXwg0DwSEvCfo"
+#define FIREBASE_HOST ""
+#define FIREBASE_AUTH ""
 
 // ==================== WIFI CREDENTIALS ====================
 #define WIFI_SSID "Andromeda"
