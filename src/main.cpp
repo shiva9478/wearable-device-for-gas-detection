@@ -9,8 +9,8 @@
 #define FIREBASE_AUTH ""
 
 // ==================== WIFI CREDENTIALS ====================
-#define WIFI_SSID "Andromeda"
-#define WIFI_PASSWORD "09876543"
+#define WIFI_SSID "Shivam 5G"
+#define WIFI_PASSWORD "9478263705"
 
 // ==================== WATCHDOG TIMEOUT ====================
 #define WDT_TIMEOUT 30
@@ -30,9 +30,9 @@ unsigned long lastStatusUpdate = 0;
 typedef struct {
   float temperature;
   float humidity;
-  int mqValue;
-  int messageNumber;
-  unsigned long timestamp;
+  int mq135Value;      // Air quality sensor (CO, ammonia, benzene, alcohol, smoke)
+  int lpgValue;        // LPG sensor (LPG, propane, methane, hydrogen)
+  uint32_t messageNumber;
 } SensorData;
 
 SensorData latestData;
@@ -44,10 +44,8 @@ void initWiFi();
 void initESPNOW();
 void initFirebase();
 void onDataReceived(const uint8_t *mac, const uint8_t *data, int len);
-void uploadLatestData();
 void updateRealtimeData();
 void printStatus();
-bool parseTextData(const char* text, SensorData &data);
 
 // ==================== SETUP ====================
 void setup() {
@@ -77,7 +75,6 @@ void loop() {
   if (hasNewData) {
     hasNewData = false;
     updateRealtimeData();  // Update current readings
-    // Skip historical data upload to reduce load
   }
   
   if (millis() - lastStatusUpdate > 10000) {
@@ -93,7 +90,8 @@ void printStartupBanner() {
   Serial.println("\n\n");
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   Serial.println("   🏥 ESP32 HEALTH MONITOR - RECEIVER   ");
-  Serial.println("   📊 Real-time Mode - Optimized        ");
+  Serial.println("   📊 Real-time Mode - Dual Gas Sensors ");
+  Serial.println("   🌬️ MQ-135 + LPG Detection            ");
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
 
@@ -192,12 +190,17 @@ void initFirebase() {
   
   Serial.println("✅ Firebase initialized");
   
-  // Initialize database structure
+  // Initialize database structure with both sensors
   esp_task_wdt_reset();
   Firebase.setString(firebaseData, "/current/status", "online");
   Firebase.setFloat(firebaseData, "/current/temperature", 0.0);
   Firebase.setFloat(firebaseData, "/current/humidity", 0.0);
-  Firebase.setInt(firebaseData, "/current/mqValue", 0);
+  Firebase.setInt(firebaseData, "/current/mq135Value", 0);
+  Firebase.setInt(firebaseData, "/current/lpgValue", 0);
+  Firebase.setString(firebaseData, "/sensors/mq135/type", "MQ-135 Air Quality");
+  Firebase.setString(firebaseData, "/sensors/mq135/detects", "CO, ammonia, benzene, alcohol, smoke");
+  Firebase.setString(firebaseData, "/sensors/lpg/type", "LPG Sensor");
+  Firebase.setString(firebaseData, "/sensors/lpg/detects", "LPG, propane, methane, hydrogen");
   Serial.println("✅ Database structure initialized");
 }
 
@@ -206,71 +209,21 @@ void onDataReceived(const uint8_t *mac, const uint8_t *data, int len) {
   messageCount++;
   senderConnected = true;
   
-  char receivedText[256];
-  memcpy(receivedText, data, len);
-  receivedText[len] = '\0';
-  
-  SensorData tempData;
-  if (parseTextData(receivedText, tempData)) {
-    latestData = tempData;
-    latestData.timestamp = millis();
+  // Receive binary data structure directly
+  if (len == sizeof(SensorData)) {
+    memcpy(&latestData, data, sizeof(SensorData));
     hasNewData = true;
     
-    Serial.printf("\r📡 Msg#%d | 🌡️%.1f°C | 💧%.1f%% | 🔬%d        ", 
-                  messageCount, latestData.temperature, 
-                  latestData.humidity, latestData.mqValue);
+    Serial.printf("\r📡 Msg#%d | 🌡️%.1f°C | 💧%.1f%% | 🌬️AirQ:%d | ⛽LPG:%d        ", 
+                  messageCount, 
+                  latestData.temperature, 
+                  latestData.humidity, 
+                  latestData.mq135Value,
+                  latestData.lpgValue);
+  } else {
+    Serial.printf("\n⚠️ Received data size mismatch: %d bytes (expected %d)\n", 
+                  len, sizeof(SensorData));
   }
-}
-
-// ==================== PARSE TEXT DATA ====================
-bool parseTextData(const char* text, SensorData &data) {
-  data.temperature = 0;
-  data.humidity = 0;
-  data.mqValue = 0;
-  data.messageNumber = 0;
-  
-  String dataStr = String(text);
-  bool isStoredMessage = dataStr.startsWith("STORED|");
-  
-  if (isStoredMessage) {
-    dataStr = dataStr.substring(7);
-  }
-  
-  int tIndex = dataStr.indexOf("T:");
-  int hIndex = dataStr.indexOf("H:");
-  int mqIndex = dataStr.indexOf("MQ:");
-  
-  if (tIndex != -1 && hIndex != -1 && mqIndex != -1) {
-    int tEnd = dataStr.indexOf("|", tIndex);
-    if (tEnd != -1) {
-      data.temperature = dataStr.substring(tIndex + 2, tEnd).toFloat();
-    }
-    
-    int hEnd = dataStr.indexOf("|", hIndex);
-    if (hEnd != -1) {
-      data.humidity = dataStr.substring(hIndex + 2, hEnd).toFloat();
-    }
-    
-    int mqEnd = dataStr.indexOf("|", mqIndex);
-    if (mqEnd == -1) mqEnd = dataStr.length();
-    data.mqValue = dataStr.substring(mqIndex + 3, mqEnd).toInt();
-    
-    if (isStoredMessage) {
-      int timeIndex = dataStr.indexOf("Time:");
-      if (timeIndex != -1) {
-        data.messageNumber = dataStr.substring(timeIndex + 5).toInt();
-      }
-    } else {
-      int msgIndex = dataStr.indexOf("|#");
-      if (msgIndex != -1) {
-        data.messageNumber = dataStr.substring(msgIndex + 2).toInt();
-      }
-    }
-    
-    return true;
-  }
-  
-  return false;
 }
 
 // ==================== UPDATE REALTIME DATA ====================
@@ -289,9 +242,10 @@ void updateRealtimeData() {
   bool success = true;
   success &= Firebase.setFloat(firebaseData, "/current/temperature", latestData.temperature);
   success &= Firebase.setFloat(firebaseData, "/current/humidity", latestData.humidity);
-  success &= Firebase.setInt(firebaseData, "/current/mqValue", latestData.mqValue);
+  success &= Firebase.setInt(firebaseData, "/current/mq135Value", latestData.mq135Value);
+  success &= Firebase.setInt(firebaseData, "/current/lpgValue", latestData.lpgValue);
   success &= Firebase.setInt(firebaseData, "/current/messageNumber", latestData.messageNumber);
-  success &= Firebase.setInt(firebaseData, "/current/timestamp", latestData.timestamp);
+  success &= Firebase.setInt(firebaseData, "/current/timestamp", millis());
   
   if (success) {
     uploadCount++;
@@ -314,5 +268,10 @@ void printStatus() {
   Serial.printf("🔥 Firebase: %s\n", Firebase.ready() ? "Ready" : "Not Ready");
   Serial.printf("📈 Success Rate: %.1f%%\n", 
                 messageCount > 0 ? (float)uploadCount/messageCount*100 : 0);
+  Serial.println("\n📊 Latest Sensor Data:");
+  Serial.printf("   🌡️ Temperature: %.1f°C\n", latestData.temperature);
+  Serial.printf("   💧 Humidity: %.1f%%\n", latestData.humidity);
+  Serial.printf("   🌬️ MQ-135 (Air Quality): %d\n", latestData.mq135Value);
+  Serial.printf("   ⛽ LPG Sensor: %d\n", latestData.lpgValue);
   Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 }
