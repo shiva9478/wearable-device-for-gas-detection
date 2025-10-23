@@ -10,7 +10,7 @@
 
 // ==================== WIFI CREDENTIALS ====================
 #define WIFI_SSID "Shivam 5G"
-#define WIFI_PASSWORD "9478263705"
+#define WIFI_PASSWORD ""
 
 // ==================== WATCHDOG TIMEOUT ====================
 #define WDT_TIMEOUT 30
